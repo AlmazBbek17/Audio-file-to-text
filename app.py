@@ -1,14 +1,17 @@
+import io
+import json
 import os
 import sqlite3
-import tempfile
 from datetime import datetime, timezone
 
 import requests
-import yt_dlp
-from flask import Flask, request, jsonify
+from docx import Document
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
+from weasyprint import HTML
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500 МБ, как заявлено в UI
 # MVP: разрешаем любые origin (расширение работает без бэкенд-аутентификации).
 # После публикации можно сузить до конкретного chrome-extension://<ID>.
 CORS(app, resources={r"/api/*": {"origins": "*"}})
@@ -42,10 +45,12 @@ def init_db():
         CREATE TABLE IF NOT EXISTS jobs (
             transcript_id TEXT PRIMARY KEY,
             device_id TEXT NOT NULL,
-            source_type TEXT NOT NULL,
             title TEXT,
             counted INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT
+            created_at TEXT,
+            text TEXT,
+            utterances TEXT,
+            duration REAL
         )
     """)
     conn.commit()
@@ -75,11 +80,11 @@ def add_seconds_used(device_id, seconds):
     conn.close()
 
 
-def save_job(transcript_id, device_id, source_type, title):
+def save_job(transcript_id, device_id, title):
     conn = get_db()
     conn.execute(
-        "INSERT INTO jobs (transcript_id, device_id, source_type, title, created_at) VALUES (?, ?, ?, ?, ?)",
-        (transcript_id, device_id, source_type, title, datetime.now(timezone.utc).isoformat()),
+        "INSERT INTO jobs (transcript_id, device_id, title, created_at) VALUES (?, ?, ?, ?)",
+        (transcript_id, device_id, title, datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
     conn.close()
@@ -97,6 +102,83 @@ def mark_job_counted(transcript_id):
     conn.execute("UPDATE jobs SET counted=1 WHERE transcript_id=?", (transcript_id,))
     conn.commit()
     conn.close()
+
+
+def save_job_result(transcript_id, text, utterances, duration):
+    conn = get_db()
+    conn.execute(
+        "UPDATE jobs SET text=?, utterances=?, duration=? WHERE transcript_id=?",
+        (text, json.dumps(utterances, ensure_ascii=False), duration, transcript_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def build_diarized_text(data):
+    """Собираем текст с метками спикеров, если AssemblyAI вернул диаризацию."""
+    utterances = data.get("utterances") or []
+    if not utterances:
+        return data.get("text", ""), []
+    lines = [f"Speaker {u['speaker']}: {u['text']}" for u in utterances]
+    return "\n\n".join(lines), utterances
+
+
+def ms_to_srt_timestamp(ms):
+    total_seconds, millis = divmod(int(ms), 1000)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+
+def build_srt(utterances, fallback_text, duration_seconds):
+    if not utterances:
+        # Нет данных о таймингах реплик — отдаём один блок на весь ролик.
+        end_ts = ms_to_srt_timestamp((duration_seconds or 0) * 1000)
+        return f"1\n00:00:00,000 --> {end_ts}\n{fallback_text}\n"
+    blocks = []
+    for i, u in enumerate(utterances, start=1):
+        start_ts = ms_to_srt_timestamp(u["start"])
+        end_ts = ms_to_srt_timestamp(u["end"])
+        blocks.append(f"{i}\n{start_ts} --> {end_ts}\nSpeaker {u['speaker']}: {u['text']}\n")
+    return "\n".join(blocks)
+
+
+def build_docx(title, text, utterances):
+    doc = Document()
+    doc.add_heading(title, level=1)
+    if utterances:
+        for u in utterances:
+            p = doc.add_paragraph()
+            run = p.add_run(f"Speaker {u['speaker']}: ")
+            run.bold = True
+            p.add_run(u["text"])
+    else:
+        for para in text.split("\n"):
+            doc.add_paragraph(para)
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
+
+
+def build_pdf(title, text, utterances):
+    if utterances:
+        body = "".join(
+            f"<p><b>Speaker {u['speaker']}:</b> {u['text']}</p>" for u in utterances
+        )
+    else:
+        body = "".join(f"<p>{para}</p>" for para in text.split("\n") if para.strip())
+    html = f"""
+    <html><head><meta charset="utf-8"><style>
+        body {{ font-family: sans-serif; font-size: 13px; line-height: 1.5; }}
+        h1 {{ font-size: 18px; }}
+    </style></head>
+    <body><h1>{title}</h1>{body}</body></html>
+    """
+    buf = io.BytesIO()
+    HTML(string=html).write_pdf(buf)
+    buf.seek(0)
+    return buf
 
 
 def assemblyai_headers():
@@ -131,55 +213,13 @@ def transcribe_file():
     transcript_res = requests.post(
         f"{ASSEMBLYAI_BASE}/transcript",
         headers=assemblyai_headers(),
-        json={"audio_url": audio_url},
+        json={"audio_url": audio_url, "speaker_labels": True},
     )
     transcript_res.raise_for_status()
     transcript_id = transcript_res.json()["id"]
 
-    save_job(transcript_id, device_id, "file", uploaded.filename)
+    save_job(transcript_id, device_id, uploaded.filename)
     return jsonify({"job_id": transcript_id})
-
-
-@app.route("/api/transcribe/youtube", methods=["POST"])
-def transcribe_youtube():
-    data = request.get_json(force=True)
-    device_id = data.get("device_id", "")
-    url = data.get("url", "")
-
-    if get_seconds_used(device_id) >= FREE_LIMIT_SECONDS:
-        return jsonify({"error": "limit_reached"}), 402
-    if not url:
-        return jsonify({"error": "no_url"}), 400
-
-    # Извлекаем ПРЯМУЮ ссылку на аудиопоток, ничего не скачивая на сервер.
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "quiet": True,
-        "noplaylist": True,
-        "skip_download": True,
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as e:
-        return jsonify({"error": "youtube_extract_failed", "detail": str(e)}), 400
-
-    direct_audio_url = info.get("url")
-    title = info.get("title", url)
-
-    if not direct_audio_url:
-        return jsonify({"error": "no_audio_stream"}), 400
-
-    transcript_res = requests.post(
-        f"{ASSEMBLYAI_BASE}/transcript",
-        headers=assemblyai_headers(),
-        json={"audio_url": direct_audio_url},
-    )
-    transcript_res.raise_for_status()
-    transcript_id = transcript_res.json()["id"]
-
-    save_job(transcript_id, device_id, "youtube", title)
-    return jsonify({"job_id": transcript_id, "title": title})
 
 
 @app.route("/api/status/<transcript_id>", methods=["GET"])
@@ -197,14 +237,15 @@ def status(transcript_id):
 
     if aai_status == "completed":
         duration = data.get("audio_duration") or 0
+        diarized_text, utterances = build_diarized_text(data)
+        save_job_result(transcript_id, diarized_text, utterances, duration)
         if not job["counted"]:
             add_seconds_used(device_id, duration)
             mark_job_counted(transcript_id)
         return jsonify({
             "status": "completed",
-            "text": data.get("text", ""),
+            "text": diarized_text,
             "audio_duration": duration,
-            "source_type": job["source_type"],
             "title": job["title"],
         })
 
@@ -212,6 +253,43 @@ def status(transcript_id):
         return jsonify({"status": "error", "detail": data.get("error")})
 
     return jsonify({"status": aai_status})
+
+
+@app.route("/api/export/<transcript_id>", methods=["GET"])
+def export(transcript_id):
+    fmt = request.args.get("format", "txt")
+    job = get_job(transcript_id)
+    if not job:
+        return jsonify({"error": "job_not_found"}), 404
+
+    text = job["text"] or ""
+    title = (job["title"] or "transcript").rsplit(".", 1)[0]
+    utterances = json.loads(job["utterances"]) if job["utterances"] else []
+    safe_name = "".join(c for c in title if c.isalnum() or c in " _-").strip() or "transcript"
+
+    if fmt == "txt":
+        buf = io.BytesIO(text.encode("utf-8"))
+        return send_file(buf, mimetype="text/plain", as_attachment=True, download_name=f"{safe_name}.txt")
+
+    if fmt == "srt":
+        srt_content = build_srt(utterances, text, job["duration"] or 0)
+        buf = io.BytesIO(srt_content.encode("utf-8"))
+        return send_file(buf, mimetype="application/x-subrip", as_attachment=True, download_name=f"{safe_name}.srt")
+
+    if fmt == "docx":
+        buf = build_docx(title, text, utterances)
+        return send_file(
+            buf,
+            mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            as_attachment=True,
+            download_name=f"{safe_name}.docx",
+        )
+
+    if fmt == "pdf":
+        buf = build_pdf(title, text, utterances)
+        return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=f"{safe_name}.pdf")
+
+    return jsonify({"error": "unknown_format"}), 400
 
 
 @app.route("/", methods=["GET"])
