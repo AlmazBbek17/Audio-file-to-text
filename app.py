@@ -37,8 +37,9 @@ DB_PATH = os.environ.get("DB_PATH", "/data/app.db")
 
 def get_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")  # снижает блокировки при параллельных воркерах gunicorn
     return conn
 
 
@@ -63,6 +64,32 @@ def init_db():
             duration REAL
         )
     """)
+
+    # Миграция со времён, когда была YouTube-ссылка: колонка source_type была NOT NULL,
+    # без значения по умолчанию — INSERT в неё сейчас падает. CREATE TABLE IF NOT EXISTS
+    # не трогает уже существующую таблицу, поэтому чиним руками, если колонка ещё жива.
+    existing_cols = [row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+    if "source_type" in existing_cols:
+        conn.execute("ALTER TABLE jobs RENAME TO jobs_old")
+        conn.execute("""
+            CREATE TABLE jobs (
+                transcript_id TEXT PRIMARY KEY,
+                device_id TEXT NOT NULL,
+                title TEXT,
+                counted INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT,
+                text TEXT,
+                utterances TEXT,
+                duration REAL
+            )
+        """)
+        old_cols = [row[1] for row in conn.execute("PRAGMA table_info(jobs_old)").fetchall()]
+        target_cols = ["transcript_id", "device_id", "title", "counted", "created_at", "text", "utterances", "duration"]
+        # если в старой таблице какой-то колонки не было — подставляем NULL, а не падаем
+        select_list = ", ".join(c if c in old_cols else "NULL" for c in target_cols)
+        conn.execute(f"INSERT INTO jobs ({', '.join(target_cols)}) SELECT {select_list} FROM jobs_old")
+        conn.execute("DROP TABLE jobs_old")
+
     conn.commit()
     conn.close()
 
