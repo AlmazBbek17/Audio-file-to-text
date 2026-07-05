@@ -8,7 +8,17 @@ import requests
 from docx import Document
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-from weasyprint import HTML
+
+# WeasyPrint тянет системные библиотеки (Pango/Cairo). Если их нет на хосте — импорт падает
+# с OSError. Раньше это падало на старте всего приложения и валило ВЕСЬ бэкенд, включая
+# транскрипцию файлов. Теперь импортируем лениво, только когда реально нужен PDF-экспорт —
+# остальной функционал продолжает работать, даже если PDF временно недоступен.
+_weasyprint_error = None
+try:
+    from weasyprint import HTML
+except Exception as e:  # noqa: BLE001
+    HTML = None
+    _weasyprint_error = str(e)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500 МБ, как заявлено в UI
@@ -162,6 +172,8 @@ def build_docx(title, text, utterances):
 
 
 def build_pdf(title, text, utterances):
+    if HTML is None:
+        raise RuntimeError(f"PDF export unavailable: {_weasyprint_error}")
     if utterances:
         body = "".join(
             f"<p><b>Speaker {u['speaker']}:</b> {u['text']}</p>" for u in utterances
@@ -286,7 +298,10 @@ def export(transcript_id):
         )
 
     if fmt == "pdf":
-        buf = build_pdf(title, text, utterances)
+        try:
+            buf = build_pdf(title, text, utterances)
+        except RuntimeError as e:
+            return jsonify({"error": "pdf_unavailable", "detail": str(e)}), 503
         return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=f"{safe_name}.pdf")
 
     return jsonify({"error": "unknown_format"}), 400
@@ -294,7 +309,7 @@ def export(transcript_id):
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "pdf_available": HTML is not None})
 
 
 if __name__ == "__main__":
