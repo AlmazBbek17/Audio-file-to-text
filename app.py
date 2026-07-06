@@ -28,7 +28,7 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
 ASSEMBLYAI_BASE = "https://api.assemblyai.com/v2"
-SPEECH_MODEL = "universal"  # самая дешёвая модель AssemblyAI ($0.15/час) — фиксируем явно,
+SPEECH_MODEL = "universal-2"  # самая дешёвая модель AssemblyAI ($0.15/час) — фиксируем явно,
                             # чтобы себестоимость была предсказуемой, а не "что дадут по умолчанию"
 
 FREE_LIMIT_SECONDS = 30 * 60  # 30 минут — держим то же значение, что и в extension/config.js
@@ -400,7 +400,7 @@ def transcribe_file():
     transcript_res = requests.post(
         f"{ASSEMBLYAI_BASE}/transcript",
         headers=assemblyai_headers(),
-        json={"audio_url": audio_url, "speaker_labels": True, "speech_model": SPEECH_MODEL},
+        json={"audio_url": audio_url, "speaker_labels": True, "speech_models": [SPEECH_MODEL]},
     )
     transcript_res.raise_for_status()
     transcript_id = transcript_res.json()["id"]
