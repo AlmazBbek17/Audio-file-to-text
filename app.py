@@ -85,6 +85,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS customers (
             device_id TEXT PRIMARY KEY,
             dodo_customer_id TEXT NOT NULL,
+            email TEXT,
             updated_at TEXT
         )
     """)
@@ -97,9 +98,23 @@ def init_db():
             status TEXT,
             remaining_balance REAL,
             next_billing_date TEXT,
+            email TEXT,
             updated_at TEXT
         )
     """)
+
+    # Миграция: у более ранних версий таблиц customers/subscriptions не было колонки email —
+    # без неё невозможно узнавать PRO-статус на новом устройстве по одному и тому же аккаунту.
+    customers_cols = [row[1] for row in conn.execute("PRAGMA table_info(customers)").fetchall()]
+    if "email" not in customers_cols:
+        conn.execute("ALTER TABLE customers ADD COLUMN email TEXT")
+
+    subs_cols = [row[1] for row in conn.execute("PRAGMA table_info(subscriptions)").fetchall()]
+    if "email" not in subs_cols:
+        conn.execute("ALTER TABLE subscriptions ADD COLUMN email TEXT")
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_customers_email ON customers(email)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_subscriptions_email ON subscriptions(email)")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS jobs (
@@ -168,19 +183,53 @@ def get_usage_row(device_id):
     return {"seconds_used": row["seconds_used"] if row else 0}
 
 
-def get_subscription(device_id):
+def get_subscription(device_id, email=None):
+    """PRO-статус привязан к почте: сначала смотрим подписку этого устройства, а если её
+    нет (или она неактивна) и передан email — ищем активную подписку того же аккаунта на
+    ЛЮБОМ другом устройстве. Найдя — сразу копируем её на текущий device_id, чтобы новое
+    устройство/переустановка сразу увидели PRO без ожидания вебхука."""
     conn = get_db()
     row = conn.execute("SELECT * FROM subscriptions WHERE device_id=?", (device_id,)).fetchone()
     conn.close()
+
+    if row and row["status"] == "active":
+        return row
+
+    if email:
+        conn = get_db()
+        email_row = conn.execute(
+            "SELECT * FROM subscriptions WHERE email=? AND status='active' ORDER BY updated_at DESC LIMIT 1",
+            (email,),
+        ).fetchone()
+        conn.close()
+        if email_row and email_row["device_id"] != device_id:
+            upsert_subscription(
+                device_id,
+                email_row["subscription_id"],
+                email_row["plan"],
+                email_row["status"],
+                email_row["remaining_balance"],
+                email_row["next_billing_date"],
+                email,
+            )
+            dodo_customer_id = get_dodo_customer_id(email_row["device_id"])
+            if dodo_customer_id:
+                upsert_customer(device_id, dodo_customer_id, email)
+            conn = get_db()
+            row = conn.execute("SELECT * FROM subscriptions WHERE device_id=?", (device_id,)).fetchone()
+            conn.close()
+            return row
+
     return row
 
 
-def has_credit(device_id):
-    """Бесплатные 30 минут ИЛИ активная подписка (превышение лимита Dodo биллит сама —
-    поэтому наличие активной подписки достаточно, отдельно считать остаток не нужно)."""
+def has_credit(device_id, email=None):
+    """Бесплатные 30 минут (на устройство) ИЛИ активная подписка — своя или найденная по
+    почте на другом устройстве (превышение лимита Dodo биллит сама — поэтому наличие активной
+    подписки достаточно, отдельно считать остаток не нужно)."""
     if get_usage_row(device_id)["seconds_used"] < FREE_LIMIT_SECONDS:
         return True
-    sub = get_subscription(device_id)
+    sub = get_subscription(device_id, email)
     return bool(sub and sub["status"] == "active")
 
 
@@ -197,39 +246,50 @@ def add_free_seconds_used(device_id, seconds):
     conn.close()
 
 
-def upsert_customer(device_id, dodo_customer_id):
+def upsert_customer(device_id, dodo_customer_id, email=None):
     conn = get_db()
     conn.execute("""
-        INSERT INTO customers (device_id, dodo_customer_id, updated_at)
-        VALUES (?, ?, ?)
+        INSERT INTO customers (device_id, dodo_customer_id, email, updated_at)
+        VALUES (?, ?, ?, ?)
         ON CONFLICT(device_id) DO UPDATE SET
             dodo_customer_id = excluded.dodo_customer_id,
+            email = COALESCE(excluded.email, customers.email),
             updated_at = excluded.updated_at
-    """, (device_id, dodo_customer_id, datetime.now(timezone.utc).isoformat()))
+    """, (device_id, dodo_customer_id, email, datetime.now(timezone.utc).isoformat()))
     conn.commit()
     conn.close()
 
 
-def get_dodo_customer_id(device_id):
+def get_dodo_customer_id(device_id, email=None):
     conn = get_db()
     row = conn.execute("SELECT dodo_customer_id FROM customers WHERE device_id=?", (device_id,)).fetchone()
+    if not row and email:
+        email_row = conn.execute(
+            "SELECT dodo_customer_id FROM customers WHERE email=? ORDER BY updated_at DESC LIMIT 1",
+            (email,),
+        ).fetchone()
+        if email_row:
+            conn.close()
+            upsert_customer(device_id, email_row["dodo_customer_id"], email)
+            return email_row["dodo_customer_id"]
     conn.close()
     return row["dodo_customer_id"] if row else None
 
 
-def upsert_subscription(device_id, subscription_id, plan, status, remaining_balance, next_billing_date):
+def upsert_subscription(device_id, subscription_id, plan, status, remaining_balance, next_billing_date, email=None):
     conn = get_db()
     conn.execute("""
-        INSERT INTO subscriptions (device_id, subscription_id, plan, status, remaining_balance, next_billing_date, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO subscriptions (device_id, subscription_id, plan, status, remaining_balance, next_billing_date, email, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(device_id) DO UPDATE SET
             subscription_id = excluded.subscription_id,
             plan = excluded.plan,
             status = excluded.status,
             remaining_balance = excluded.remaining_balance,
             next_billing_date = excluded.next_billing_date,
+            email = COALESCE(excluded.email, subscriptions.email),
             updated_at = excluded.updated_at
-    """, (device_id, subscription_id, plan, status, remaining_balance, next_billing_date, datetime.now(timezone.utc).isoformat()))
+    """, (device_id, subscription_id, plan, status, remaining_balance, next_billing_date, email, datetime.now(timezone.utc).isoformat()))
     conn.commit()
     conn.close()
 
@@ -364,8 +424,9 @@ def assemblyai_headers():
 @app.route("/api/usage", methods=["GET"])
 def usage():
     device_id = request.args.get("device_id", "")
+    email = request.args.get("email") or None
     u = get_usage_row(device_id)
-    sub = get_subscription(device_id)
+    sub = get_subscription(device_id, email)
     return jsonify({
         "seconds_used": u["seconds_used"],
         "limit_seconds": FREE_LIMIT_SECONDS,
@@ -381,7 +442,8 @@ def usage():
 @app.route("/api/transcribe/file", methods=["POST"])
 def transcribe_file():
     device_id = request.form.get("device_id", "")
-    if not has_credit(device_id):
+    email = request.form.get("email") or None
+    if not has_credit(device_id, email):
         return jsonify({"error": "limit_reached"}), 402
 
     uploaded = request.files.get("file")
@@ -400,7 +462,16 @@ def transcribe_file():
     transcript_res = requests.post(
         f"{ASSEMBLYAI_BASE}/transcript",
         headers=assemblyai_headers(),
-        json={"audio_url": audio_url, "speaker_labels": True, "speech_models": [SPEECH_MODEL]},
+        json={
+            "audio_url": audio_url,
+            "speaker_labels": True,
+            "speech_models": [SPEECH_MODEL],
+            # Без этого AssemblyAI по умолчанию считает язык английским (en_us) и
+            # "подгоняет" под него любую речь — из-за этого казалось, что она переводит.
+            # language_detection сама определяет язык (в т.ч. смену языка внутри
+            # одного файла — code switching) и транскрибирует именно на нём.
+            "language_detection": True,
+        },
     )
     transcript_res.raise_for_status()
     transcript_id = transcript_res.json()["id"]
@@ -496,21 +567,31 @@ def subscribe():
     data = request.get_json(force=True)
     device_id = data.get("device_id", "")
     plan = data.get("plan", "")
+    email = data.get("email")  # из Google-аккаунта, если пользователь уже вошёл
+    name = data.get("name")
 
     if not device_id:
         return jsonify({"error": "no_device_id"}), 400
+    # Вход через Google обязателен перед оплатой (делает это extension UI) — без email
+    # PRO-статус невозможно привязать к аккаунту и восстановить на другом устройстве.
+    if not email:
+        return jsonify({"error": "email_required"}), 400
     if plan not in PLANS:
         return jsonify({"error": "invalid_plan"}), 400
     product_id = PLANS[plan]["product_id"]
     if not DODO_API_KEY or not product_id:
         return jsonify({"error": "payments_not_configured"}), 503
 
+    checkout_kwargs = dict(
+        product_cart=[{"product_id": product_id, "quantity": 1}],
+        return_url=f"{request.url_root.rstrip('/')}/payment-success",
+        metadata={"device_id": device_id, "plan": plan, "email": email},
+        # Автозаполнение почты на странице оплаты Dodo — пользователь ничего не вводит руками.
+        customer={"email": email, "name": name or email},
+    )
+
     try:
-        session = dodo_client().checkout_sessions.create(
-            product_cart=[{"product_id": product_id, "quantity": 1}],
-            return_url=f"{request.url_root.rstrip('/')}/payment-success",
-            metadata={"device_id": device_id, "plan": plan},
-        )
+        session = dodo_client().checkout_sessions.create(**checkout_kwargs)
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": "dodo_error", "detail": str(e)}), 502
 
@@ -519,6 +600,20 @@ def subscribe():
         return jsonify({"error": "no_checkout_url"}), 502
 
     return jsonify({"checkout_url": checkout_url})
+
+
+@app.route("/api/customer-portal", methods=["GET"])
+def customer_portal():
+    device_id = request.args.get("device_id", "")
+    email = request.args.get("email") or None
+    dodo_customer_id = get_dodo_customer_id(device_id, email)
+    if not dodo_customer_id:
+        return jsonify({"error": "no_customer"}), 404
+    try:
+        session = dodo_client().customers.customer_portal.create(dodo_customer_id)
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": "dodo_error", "detail": str(e)}), 502
+    return jsonify({"url": session.link})
 
 
 @app.route("/api/webhooks/dodo", methods=["POST"])
@@ -549,9 +644,12 @@ def dodo_webhook():
         plan = metadata.get("plan")
         customer = sub_data.get("customer", {})
         dodo_customer_id = customer.get("customer_id") if isinstance(customer, dict) else None
+        # email из metadata (проставили сами в /api/subscribe) либо, если Dodo его вернул,
+        # из объекта customer — нужен, чтобы PRO-статус узнавался на любом устройстве этого аккаунта.
+        email = metadata.get("email") or (customer.get("email") if isinstance(customer, dict) else None)
 
         if device_id and dodo_customer_id:
-            upsert_customer(device_id, dodo_customer_id)
+            upsert_customer(device_id, dodo_customer_id, email)
 
             remaining_balance = None
             credit_cart = sub_data.get("credit_entitlement_cart") or []
@@ -568,6 +666,7 @@ def dodo_webhook():
                 sub_data.get("status"),
                 remaining_balance,
                 sub_data.get("next_billing_date"),
+                email,
             )
 
     return jsonify({"ok": True})
