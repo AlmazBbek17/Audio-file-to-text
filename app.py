@@ -499,6 +499,25 @@ def process_transcription_job(job_id, filepath, original_filename):
                     os.remove(p)
                 except OSError:
                     pass
+
+
+def _run_job_safely(job_id, filepath, original_filename):
+    """Обёртка на случай непредвиденной ошибки ВНЕ try/except внутри самой задачи (как
+    только что произошло с случайно затёртой build_diarized_text). Без этой страховки
+    исключение в фоновом потоке ThreadPoolExecutor молча проглатывается (Future никто
+    не читает), и задача зависает в статусе "uploading" навсегда — ни ошибки у
+    пользователя, ни следа в логах."""
+    try:
+        process_transcription_job(job_id, filepath, original_filename)
+    except Exception as e:  # noqa: BLE001
+        print(f"[error] unhandled failure in job {job_id}: {e}")
+        try:
+            update_job_status(job_id, "error", error_detail=str(e)[:500])
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def build_diarized_text(data):
     """Собираем текст с метками спикеров, если AssemblyAI вернул диаризацию."""
     utterances = data.get("utterances") or []
     if not utterances:
@@ -612,7 +631,7 @@ def transcribe_file():
     # Вырезание звука (для видео) и заливка в AssemblyAI уходят в фоновый пул потоков —
     # запрос не держит воркер gunicorn всё это время, поэтому другие пользователи не
     # встают в очередь позади одной большой задачи.
-    job_executor.submit(process_transcription_job, job_id, filepath, uploaded.filename)
+    job_executor.submit(_run_job_safely, job_id, filepath, uploaded.filename)
 
     return jsonify({"job_id": job_id})
 
