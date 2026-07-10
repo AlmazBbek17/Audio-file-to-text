@@ -639,6 +639,7 @@ def transcribe_file():
 @app.route("/api/status/<job_id>", methods=["GET"])
 def status(job_id):
     device_id = request.args.get("device_id", "")
+    email = request.args.get("email") or None
     job = get_job(job_id)
     if not job:
         return jsonify({"error": "job_not_found"}), 404
@@ -663,16 +664,27 @@ def status(job_id):
         diarized_text, utterances = build_diarized_text(data)
         save_job_result(job_id, diarized_text, utterances, duration)
         if not job["counted"]:
-            # Бесплатные 30 минут по-прежнему считаем сами; если они уже исчерпаны и есть
-            # активная подписка — send_usage_event списывает минуты через Dodo (включая overage).
-            u = get_usage_row(device_id)
-            remaining_free = max(0, FREE_LIMIT_SECONDS - u["seconds_used"])
-            from_free = min(duration, remaining_free)
-            if from_free > 0:
-                add_free_seconds_used(device_id, from_free)
-            from_subscription = duration - from_free
-            if from_subscription > 0:
-                send_usage_event(device_id, transcript_id, from_subscription)
+            sub = get_subscription(device_id, email)
+            is_subscribed = bool(sub and sub["status"] == "active")
+
+            if is_subscribed:
+                # Активная подписка — ВСЯ длительность списывается с неё через Dodo.
+                # Раньше здесь сначала расходовались бесплатные 30 минут (общий счётчик
+                # seconds_used) и только остаток сверху уходил в send_usage_event — из-за
+                # этого у только что оформивших PRO первые 30 минут вообще не уменьшали
+                # баланс подписки, хотя человек уже платит. Для подписчиков бесплатный
+                # бакет больше не участвует вовсе.
+                if duration > 0:
+                    send_usage_event(device_id, transcript_id, duration)
+            else:
+                # Без подписки — как раньше, списываем из бесплатных 30 минут
+                # (has_credit уже не пропустил бы сюда, если бы они кончились).
+                u = get_usage_row(device_id)
+                remaining_free = max(0, FREE_LIMIT_SECONDS - u["seconds_used"])
+                from_free = min(duration, remaining_free)
+                if from_free > 0:
+                    add_free_seconds_used(device_id, from_free)
+
             mark_job_counted(job_id)
         return jsonify({
             "status": "completed",
