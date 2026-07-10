@@ -8,5 +8,6 @@ aptPkgs = [
   "libgdk-pixbuf2.0-0",
   "libffi-dev",
   "shared-mime-info",
-  "fonts-liberation"
+  "fonts-liberation",
+  "ffmpeg"
 ]

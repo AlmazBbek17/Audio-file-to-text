@@ -2,12 +2,16 @@ import io
 import json
 import os
 import sqlite3
+import subprocess
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import requests
 from docx import Document
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
+from werkzeug.utils import secure_filename
 
 # WeasyPrint тянет системные библиотеки (Pango/Cairo). Если их нет на хосте — импорт падает
 # с OSError. Раньше это падало на старте всего приложения и валило ВЕСЬ бэкенд, включая
@@ -21,10 +25,27 @@ except Exception as e:  # noqa: BLE001
     _weasyprint_error = str(e)
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500 МБ, как заявлено в UI
+app.config["MAX_CONTENT_LENGTH"] = 3 * 1024 * 1024 * 1024  # 3 ГБ — с запасом под видеофайлы
 # MVP: разрешаем любые origin (расширение работает без бэкенд-аутентификации).
 # После публикации можно сузить до конкретного chrome-extension://<ID>.
 CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+# Временные файлы загрузок (сырое видео/аудио до отправки в AssemblyAI) — НЕ в /data
+# (тот volume только для sqlite и должен оставаться маленьким), а в эфемерном /tmp.
+UPLOAD_TMP_DIR = os.environ.get("UPLOAD_TMP_DIR", "/tmp/uploads")
+os.makedirs(UPLOAD_TMP_DIR, exist_ok=True)
+
+# Сколько файлов обрабатываем параллельно в фоне (ffmpeg + заливка в AssemblyAI).
+# Не привязано к числу воркеров gunicorn — это ограничивает именно CPU/сеть под капотом,
+# остальные заявки просто встают в очередь пула, а не роняют сервер. Подбирай под реальные
+# ресурсы Railway (больше vCPU/RAM — можно поднимать).
+JOB_WORKERS = int(os.environ.get("JOB_WORKERS", "4"))
+job_executor = ThreadPoolExecutor(max_workers=JOB_WORKERS, thread_name_prefix="job")
+
+# Расширения, для которых имеет смысл сначала вырезать звук через ffmpeg — в видео
+# звуковая дорожка обычно занимает не больше 10% веса файла, остальное тратить на
+# заливку в AssemblyAI бессмысленно.
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".wmv", ".flv"}
 
 ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
 ASSEMBLYAI_BASE = "https://api.assemblyai.com/v2"
@@ -118,10 +139,13 @@ def init_db():
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS jobs (
-            transcript_id TEXT PRIMARY KEY,
+            job_id TEXT PRIMARY KEY,
+            transcript_id TEXT,
             device_id TEXT NOT NULL,
             title TEXT,
             counted INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'received',
+            error_detail TEXT,
             created_at TEXT,
             text TEXT,
             utterances TEXT,
@@ -137,10 +161,13 @@ def init_db():
         conn.execute("ALTER TABLE jobs RENAME TO jobs_old")
         conn.execute("""
             CREATE TABLE jobs (
-                transcript_id TEXT PRIMARY KEY,
+                job_id TEXT PRIMARY KEY,
+                transcript_id TEXT,
                 device_id TEXT NOT NULL,
                 title TEXT,
                 counted INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'received',
+                error_detail TEXT,
                 created_at TEXT,
                 text TEXT,
                 utterances TEXT,
@@ -148,11 +175,48 @@ def init_db():
             )
         """)
         old_cols = [row[1] for row in conn.execute("PRAGMA table_info(jobs_old)").fetchall()]
-        target_cols = ["transcript_id", "device_id", "title", "counted", "created_at", "text", "utterances", "duration"]
-        # если в старой таблице какой-то колонки не было — подставляем NULL, а не падаем
-        select_list = ", ".join(c if c in old_cols else "NULL" for c in target_cols)
+        # У старых строк job_id ещё не было — раньше единственным идентификатором был
+        # transcript_id (его же фронтенд уже хранит как "id" в локальной истории), поэтому
+        # переиспользуем его как job_id, чтобы старые ссылки на экспорт не сломались.
+        target_cols = ["job_id", "transcript_id", "device_id", "title", "counted", "status", "created_at", "text", "utterances", "duration"]
+        select_list = ", ".join([
+            "transcript_id", "transcript_id",
+            *(c if c in old_cols else "NULL" for c in ["device_id", "title", "counted"]),
+            "'processing'",
+            *(c if c in old_cols else "NULL" for c in ["created_at", "text", "utterances", "duration"]),
+        ])
         conn.execute(f"INSERT INTO jobs ({', '.join(target_cols)}) SELECT {select_list} FROM jobs_old")
         conn.execute("DROP TABLE jobs_old")
+
+    # Отдельная миграция: у более ранних версий таблицы jobs (уже без source_type) primary
+    # key был transcript_id, а не job_id — тот же перенос данных, что и выше.
+    jobs_cols = [row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+    if "job_id" not in jobs_cols:
+        conn.execute("ALTER TABLE jobs RENAME TO jobs_old")
+        conn.execute("""
+            CREATE TABLE jobs (
+                job_id TEXT PRIMARY KEY,
+                transcript_id TEXT,
+                device_id TEXT NOT NULL,
+                title TEXT,
+                counted INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'received',
+                error_detail TEXT,
+                created_at TEXT,
+                text TEXT,
+                utterances TEXT,
+                duration REAL
+            )
+        """)
+        conn.execute("""
+            INSERT INTO jobs (job_id, transcript_id, device_id, title, counted, status, created_at, text, utterances, duration)
+            SELECT transcript_id, transcript_id, device_id, title, counted, 'processing', created_at, text, utterances, duration
+            FROM jobs_old
+        """)
+        conn.execute("DROP TABLE jobs_old")
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_transcript_id ON jobs(transcript_id)")
+
 
     # Более старая миграция: колонка paid_seconds_balance из версии с разовыми платежами ($1/час)
     # больше не нужна — теперь баланс живёт в Dodo и приходит через вебхук подписки.
@@ -314,41 +378,127 @@ def send_usage_event(device_id, transcript_id, duration_seconds):
         print(f"[warn] failed to send usage event for {transcript_id}: {e}")
 
 
-def save_job(transcript_id, device_id, title):
+def save_job(job_id, device_id, title):
     conn = get_db()
     conn.execute(
-        "INSERT INTO jobs (transcript_id, device_id, title, created_at) VALUES (?, ?, ?, ?)",
-        (transcript_id, device_id, title, datetime.now(timezone.utc).isoformat()),
+        "INSERT INTO jobs (job_id, device_id, title, status, created_at) VALUES (?, ?, ?, ?, ?)",
+        (job_id, device_id, title, "received", datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
     conn.close()
 
 
-def get_job(transcript_id):
+def get_job(job_id):
     conn = get_db()
-    row = conn.execute("SELECT * FROM jobs WHERE transcript_id=?", (transcript_id,)).fetchone()
+    row = conn.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
     conn.close()
     return row
 
 
-def mark_job_counted(transcript_id):
+def update_job_status(job_id, status, error_detail=None):
     conn = get_db()
-    conn.execute("UPDATE jobs SET counted=1 WHERE transcript_id=?", (transcript_id,))
+    conn.execute("UPDATE jobs SET status=?, error_detail=? WHERE job_id=?", (status, error_detail, job_id))
     conn.commit()
     conn.close()
 
 
-def save_job_result(transcript_id, text, utterances, duration):
+def set_job_transcript_id(job_id, transcript_id):
+    conn = get_db()
+    conn.execute("UPDATE jobs SET transcript_id=?, status=? WHERE job_id=?", (transcript_id, "processing", job_id))
+    conn.commit()
+    conn.close()
+
+
+def mark_job_counted(job_id):
+    conn = get_db()
+    conn.execute("UPDATE jobs SET counted=1 WHERE job_id=?", (job_id,))
+    conn.commit()
+    conn.close()
+
+
+def save_job_result(job_id, text, utterances, duration):
     conn = get_db()
     conn.execute(
-        "UPDATE jobs SET text=?, utterances=?, duration=? WHERE transcript_id=?",
-        (text, json.dumps(utterances, ensure_ascii=False), duration, transcript_id),
+        "UPDATE jobs SET text=?, utterances=?, duration=? WHERE job_id=?",
+        (text, json.dumps(utterances, ensure_ascii=False), duration, job_id),
     )
     conn.commit()
     conn.close()
 
 
-def build_diarized_text(data):
+def is_video_file(filename):
+    ext = os.path.splitext(filename or "")[1].lower()
+    return ext in VIDEO_EXTENSIONS
+
+
+def extract_audio(input_path, output_path):
+    """Вырезаем только звук из видео через ffmpeg — экономит и память (обрабатывается
+    потоково, не грузится в RAM целиком), и трафик/время до AssemblyAI, т.к. видео-дорожка
+    (обычно основной вес файла) для транскрипции не нужна."""
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-vn",                  # без видео
+        "-ac", "1",              # моно — распознаванию речи стерео не нужно
+        "-ar", "16000",          # AssemblyAI всё равно ресэмплит в 16kHz — сразу отдаём в этом виде
+        "-c:a", "aac", "-b:a", "96k",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, timeout=1800)  # 30 минут максимум на конвертацию
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {result.stderr.decode(errors='ignore')[-500:]}")
+
+
+def process_transcription_job(job_id, filepath, original_filename):
+    """Работает в фоновом пуле потоков — не держит воркер gunicorn всё время загрузки/
+    конвертации/заливки в AssemblyAI, поэтому другие пользователи не встают в очередь
+    позади одной большой задачи."""
+    extracted_path = None
+    try:
+        audio_path = filepath
+        if is_video_file(original_filename):
+            update_job_status(job_id, "extracting")
+            extracted_path = f"{filepath}.audio.m4a"
+            extract_audio(filepath, extracted_path)
+            audio_path = extracted_path
+
+        update_job_status(job_id, "uploading")
+        with open(audio_path, "rb") as f:
+            # requests стримит файловый объект по частям, а не грузит всё содержимое в
+            # память разом — важно для аудио, вырезанного из многогигабайтного видео.
+            upload_res = requests.post(
+                f"{ASSEMBLYAI_BASE}/upload",
+                headers=assemblyai_headers(),
+                data=f,
+            )
+        upload_res.raise_for_status()
+        audio_url = upload_res.json()["upload_url"]
+
+        transcript_res = requests.post(
+            f"{ASSEMBLYAI_BASE}/transcript",
+            headers=assemblyai_headers(),
+            json={
+                "audio_url": audio_url,
+                "speaker_labels": True,
+                "speech_models": [SPEECH_MODEL],
+                # Без этого AssemblyAI по умолчанию считает язык английским (en_us) и
+                # "подгоняет" под него любую речь. language_detection сама определяет
+                # язык (в т.ч. смену языка внутри одного файла — code switching).
+                "language_detection": True,
+            },
+        )
+        transcript_res.raise_for_status()
+        transcript_id = transcript_res.json()["id"]
+        set_job_transcript_id(job_id, transcript_id)
+    except Exception as e:  # noqa: BLE001
+        print(f"[error] job {job_id} failed: {e}")
+        update_job_status(job_id, "error", error_detail=str(e)[:500])
+    finally:
+        for p in (filepath, extracted_path):
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
     """Собираем текст с метками спикеров, если AssemblyAI вернул диаризацию."""
     utterances = data.get("utterances") or []
     if not utterances:
@@ -450,43 +600,39 @@ def transcribe_file():
     if not uploaded:
         return jsonify({"error": "no_file"}), 400
 
-    # Заливаем файл напрямую в AssemblyAI (потоково, без лишнего диска)
-    upload_res = requests.post(
-        f"{ASSEMBLYAI_BASE}/upload",
-        headers=assemblyai_headers(),
-        data=uploaded.stream.read(),
-    )
-    upload_res.raise_for_status()
-    audio_url = upload_res.json()["upload_url"]
+    job_id = str(uuid.uuid4())
+    safe_name = secure_filename(uploaded.filename or "audio") or "audio"
+    filepath = os.path.join(UPLOAD_TMP_DIR, f"{job_id}_{safe_name}")
+    # .save() пишет на диск потоково (чанками), а НЕ грузит весь файл в RAM разом —
+    # критично для видео на 2-3 ГБ при большом числе одновременных пользователей.
+    uploaded.save(filepath)
 
-    transcript_res = requests.post(
-        f"{ASSEMBLYAI_BASE}/transcript",
-        headers=assemblyai_headers(),
-        json={
-            "audio_url": audio_url,
-            "speaker_labels": True,
-            "speech_models": [SPEECH_MODEL],
-            # Без этого AssemblyAI по умолчанию считает язык английским (en_us) и
-            # "подгоняет" под него любую речь — из-за этого казалось, что она переводит.
-            # language_detection сама определяет язык (в т.ч. смену языка внутри
-            # одного файла — code switching) и транскрибирует именно на нём.
-            "language_detection": True,
-        },
-    )
-    transcript_res.raise_for_status()
-    transcript_id = transcript_res.json()["id"]
+    save_job(job_id, device_id, uploaded.filename)
 
-    save_job(transcript_id, device_id, uploaded.filename)
-    return jsonify({"job_id": transcript_id})
+    # Вырезание звука (для видео) и заливка в AssemblyAI уходят в фоновый пул потоков —
+    # запрос не держит воркер gunicorn всё это время, поэтому другие пользователи не
+    # встают в очередь позади одной большой задачи.
+    job_executor.submit(process_transcription_job, job_id, filepath, uploaded.filename)
+
+    return jsonify({"job_id": job_id})
 
 
-@app.route("/api/status/<transcript_id>", methods=["GET"])
-def status(transcript_id):
+@app.route("/api/status/<job_id>", methods=["GET"])
+def status(job_id):
     device_id = request.args.get("device_id", "")
-    job = get_job(transcript_id)
+    job = get_job(job_id)
     if not job:
         return jsonify({"error": "job_not_found"}), 404
 
+    if job["status"] == "error":
+        return jsonify({"status": "error", "detail": job["error_detail"]})
+
+    if not job["transcript_id"]:
+        # Ещё готовим файл на нашей стороне (received / extracting / uploading) —
+        # транскрипта в AssemblyAI пока не существует, спрашивать там нечего.
+        return jsonify({"status": job["status"]})
+
+    transcript_id = job["transcript_id"]
     res = requests.get(f"{ASSEMBLYAI_BASE}/transcript/{transcript_id}", headers=assemblyai_headers())
     res.raise_for_status()
     data = res.json()
@@ -496,7 +642,7 @@ def status(transcript_id):
     if aai_status == "completed":
         duration = data.get("audio_duration") or 0
         diarized_text, utterances = build_diarized_text(data)
-        save_job_result(transcript_id, diarized_text, utterances, duration)
+        save_job_result(job_id, diarized_text, utterances, duration)
         if not job["counted"]:
             # Бесплатные 30 минут по-прежнему считаем сами; если они уже исчерпаны и есть
             # активная подписка — send_usage_event списывает минуты через Dodo (включая overage).
@@ -508,7 +654,7 @@ def status(transcript_id):
             from_subscription = duration - from_free
             if from_subscription > 0:
                 send_usage_event(device_id, transcript_id, from_subscription)
-            mark_job_counted(transcript_id)
+            mark_job_counted(job_id)
         return jsonify({
             "status": "completed",
             "text": diarized_text,
@@ -517,15 +663,16 @@ def status(transcript_id):
         })
 
     if aai_status == "error":
+        update_job_status(job_id, "error", error_detail=data.get("error"))
         return jsonify({"status": "error", "detail": data.get("error")})
 
     return jsonify({"status": aai_status})
 
 
-@app.route("/api/export/<transcript_id>", methods=["GET"])
-def export(transcript_id):
+@app.route("/api/export/<job_id>", methods=["GET"])
+def export(job_id):
     fmt = request.args.get("format", "txt")
-    job = get_job(transcript_id)
+    job = get_job(job_id)
     if not job:
         return jsonify({"error": "job_not_found"}), 404
 
