@@ -782,6 +782,44 @@ def customer_portal():
     return jsonify({"url": session.link})
 
 
+def _extract_balance_after(data):
+    """Достаём остаток из полезной нагрузки credit.* вебхука. Точное имя поля Dodo нигде
+    явно не документирует построчно, поэтому перебираем правдоподобные варианты — так
+    надёжнее, чем гадать один конкретный ключ и молча ничего не находить."""
+    candidates = (data, data.get("credit") or {}, data.get("entitlement") or {}, data.get("credit_entitlement") or {})
+    for obj in candidates:
+        if not isinstance(obj, dict):
+            continue
+        for key in ("balance_after", "balance", "remaining_balance", "current_balance"):
+            if obj.get(key) is not None:
+                try:
+                    return float(obj[key])
+                except (TypeError, ValueError):
+                    continue
+    return None
+
+
+def _extract_customer_id(data):
+    customer = data.get("customer")
+    if isinstance(customer, dict) and customer.get("customer_id"):
+        return customer["customer_id"]
+    return data.get("customer_id")
+
+
+def update_balance_for_customer(dodo_customer_id, remaining_balance):
+    """Списание могло случиться на устройстве, где подписка НЕ была оформлена (мы же
+    привязываем PRO к email на любое устройство) — поэтому обновляем remaining_balance
+    сразу у всех device_id этого customer_id, а не только у того, что в metadata."""
+    conn = get_db()
+    conn.execute(
+        """UPDATE subscriptions SET remaining_balance=?, updated_at=?
+           WHERE device_id IN (SELECT device_id FROM customers WHERE dodo_customer_id=?)""",
+        (remaining_balance, datetime.now(timezone.utc).isoformat(), dodo_customer_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 @app.route("/api/webhooks/dodo", methods=["POST"])
 def dodo_webhook():
     raw_body = request.get_data()
@@ -834,6 +872,21 @@ def dodo_webhook():
                 sub_data.get("next_billing_date"),
                 email,
             )
+
+    # credit.* — отдельная категория событий (не subscription.*!) — именно она приходит
+    # при каждом списании через meter (наши send_usage_event) и при начислении новых
+    # credits. Раньше мы её вообще не слушали, поэтому remaining_balance обновлялся
+    # только в момент оформления/продления подписки и не менялся при использовании.
+    elif event_type.startswith("credit."):
+        data = payload.get("data", {})
+        dodo_customer_id = _extract_customer_id(data)
+        remaining_balance = _extract_balance_after(data)
+        if dodo_customer_id and remaining_balance is not None:
+            update_balance_for_customer(dodo_customer_id, remaining_balance)
+        else:
+            # Не смогли распарсить — печатаем сырой payload, чтобы разобрать точные имена
+            # полей по реальному событию из логов, а не гадать по документации.
+            print(f"[warn] credit webhook '{event_type}' — couldn't parse customer/balance: {json.dumps(data)[:500]}")
 
     return jsonify({"ok": True})
 
